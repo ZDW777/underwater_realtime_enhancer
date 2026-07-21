@@ -1,0 +1,6 @@
+PySide6>=6.7,<7
+opencv-python>=4.10,<5
+numpy>=1.26,<3
+
+# PyTorch 2.8.0 + CUDA 12.8 is expected to be installed separately.
+# TensorRT is optional and only needed for trt16/trt8 modes.
