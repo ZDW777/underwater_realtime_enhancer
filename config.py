@@ -34,6 +34,10 @@ class RunConfig:
     height: int
     source: str | int
     source_kind: str
+    # 工作线程只把与界面控件大小接近的缩略图放入预览缓冲区；完整分辨率
+    # 的增强结果仍直接交给视频写入器或图像保存逻辑，不会降低保存质量。
+    preview_width: int = 1280
+    preview_height: int = 720
     save_output: bool = False
     output_dir: Path | None = None
 

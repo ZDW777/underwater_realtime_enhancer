@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
+import time
 
-import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -88,31 +89,72 @@ class OceanHeader(QWidget):
 class PreviewWidget(QWidget):
     """保持原始宽高比显示 OpenCV 画面，并绘制窗口标题与空状态。"""
 
+    # 只有新帧真正进入paintEvent并完成绘制时才发出，用于统计用户实际
+    # 看见的显示FPS，而不是工作线程产帧速度或定时器触发频率。
+    frame_presented = Signal()
+
     def __init__(self, title: str, accent: str, parent=None):
         super().__init__(parent)
         self.title = title
         self.accent = QColor(accent)
-        self._pixmap: QPixmap | None = None
+        self._source_pixmap: QPixmap | None = None
+        self._display_pixmap: QPixmap | None = None
+        self._frame_serial = 0
+        self._painted_serial = -1
         self.setMinimumSize(360, 235)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def set_frame(self, bgr: np.ndarray) -> None:
-        # Qt 使用 RGB，而 OpenCV 默认使用 BGR，因此显示前先转换颜色顺序。
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        height, width, channels = rgb.shape
+        """直接接收OpenCV BGR图像，避免每帧执行BGR→RGB颜色转换。"""
+        if bgr.ndim != 3 or bgr.shape[2] != 3 or bgr.dtype != np.uint8:
+            raise ValueError("预览帧必须是HWC排列的uint8三通道BGR图像")
+        contiguous_bgr = np.ascontiguousarray(bgr)
+        height, width, _ = contiguous_bgr.shape
         image = QImage(
-            rgb.data,
+            contiguous_bgr.data,
             width,
             height,
-            channels * width,
-            QImage.Format.Format_RGB888,
+            contiguous_bgr.strides[0],
+            QImage.Format.Format_BGR888,
         ).copy()
-        self._pixmap = QPixmap.fromImage(image)
+        # copy()让QImage拥有独立内存，工作线程随后释放numpy数组也不会影响显示。
+        self._source_pixmap = QPixmap.fromImage(image)
+        self._frame_serial += 1
+        self._refresh_display_pixmap()
         self.update()
 
     def clear_frame(self) -> None:
-        self._pixmap = None
+        self._source_pixmap = None
+        self._display_pixmap = None
         self.update()
+
+    def preview_extent(self) -> tuple[int, int]:
+        """返回扣除边距后的实际画面区域，供工作线程生成等尺寸缩略图。"""
+        return max(1, self.width() - 14), max(1, self.height() - 14)
+
+    def _refresh_display_pixmap(self) -> None:
+        """仅在新帧或窗口尺寸变化时缩放，paintEvent只负责轻量绘制。"""
+        if self._source_pixmap is None:
+            self._display_pixmap = None
+            return
+        available_width, available_height = self.preview_extent()
+        if (
+            self._source_pixmap.width() <= available_width
+            and self._source_pixmap.height() <= available_height
+        ):
+            # 工作线程已按控件尺寸生成缩略图时直接复用，避免重复缩放。
+            self._display_pixmap = self._source_pixmap
+        else:
+            self._display_pixmap = self._source_pixmap.scaled(
+                available_width,
+                available_height,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        self._refresh_display_pixmap()
+        super().resizeEvent(event)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -126,16 +168,14 @@ class PreviewWidget(QWidget):
         painter.setPen(QPen(QColor("#21445a"), 1))
         painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 10, 10)
 
-        if self._pixmap is not None:
-            available = self.rect().adjusted(7, 7, -7, -7)
-            scaled = self._pixmap.scaled(
-                available.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            x = (self.width() - scaled.width()) // 2
-            y = (self.height() - scaled.height()) // 2
-            painter.drawPixmap(x, y, scaled)
+        presented_new_frame = False
+        if self._display_pixmap is not None:
+            x = (self.width() - self._display_pixmap.width()) // 2
+            y = (self.height() - self._display_pixmap.height()) // 2
+            painter.drawPixmap(x, y, self._display_pixmap)
+            if self._painted_serial != self._frame_serial:
+                self._painted_serial = self._frame_serial
+                presented_new_frame = True
         else:
             painter.setPen(QColor("#5e8295"))
             placeholder_font = QFont()
@@ -157,6 +197,8 @@ class PreviewWidget(QWidget):
         font.setBold(True)
         painter.setFont(font)
         painter.drawText(QRectF(42, 14, 70, 34), Qt.AlignmentFlag.AlignVCenter, self.title)
+        if presented_new_frame:
+            self.frame_presented.emit()
 
 
 class MetricCard(QFrame):
@@ -186,7 +228,11 @@ class MetricCard(QFrame):
         layout.addLayout(text_box, 1)
 
     def set_value(self, value: float, unit: str) -> None:
-        self.value.setText(f"{value:.2f} {unit}")
+        # 一位小数足以反映实时性能，也能避免无意义的小数位持续跳动。
+        self.value.setText(f"{value:.1f} {unit}")
+
+    def clear_value(self, unit: str) -> None:
+        self.value.setText(f"-- {unit}")
 
 
 class MainWindow(QMainWindow):
@@ -203,12 +249,26 @@ class MainWindow(QMainWindow):
         # 仅当用户主动点击红色“结束”按钮时置为 True，用于忽略工作线程
         # 已经排队但尚未送达主线程的最后几帧，确保预览区保持等待状态。
         self._clear_previews_on_finish = False
+        self._playback_active = False
+        self._playback_paused = False
+        self._source_fps = 30.0
+        self._last_display_time: float | None = None
+        self._display_intervals: deque[float] = deque(maxlen=60)
 
         self.setWindowTitle("水下图像 / 视频实时增强")
         screen = self.screen().availableGeometry()
         # 默认占用约九成可用屏幕，同时给系统任务栏保留空间。
         self.resize(int(screen.width() * 0.92), int(screen.height() * 0.90))
         self._build_ui()
+        # 显示定时器只从工作线程的有界缓冲区取帧；指标定时器每200 ms读取
+        # 一次滑动窗口快照，二者均不再依赖逐帧Qt信号。
+        self._display_timer = QTimer(self)
+        self._display_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._display_timer.timeout.connect(self._display_next_frame)
+        self._metrics_timer = QTimer(self)
+        self._metrics_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._metrics_timer.setInterval(200)
+        self._metrics_timer.timeout.connect(self._show_metrics)
         self._apply_style()
         self.refresh_models()
         self._update_resolution_controls()
@@ -317,8 +377,8 @@ class MainWindow(QMainWindow):
         metrics = QHBoxLayout()
         metrics.setSpacing(10)
         self.inference_card = MetricCard("≈", "GPU 推理耗时", "ms", "#57e3d2")
-        self.inference_fps_card = MetricCard("◉", "纯推理帧率", "FPS", "#55bff2")
-        self.total_fps_card = MetricCard("↗", "端到端处理帧率", "FPS", "#8ee89a")
+        self.inference_fps_card = MetricCard("◉", "GPU 推理帧率", "FPS", "#55bff2")
+        self.total_fps_card = MetricCard("↗", "实际显示帧率", "FPS", "#8ee89a")
         metrics.addWidget(self.inference_card)
         metrics.addWidget(self.inference_fps_card)
         metrics.addWidget(self.total_fps_card)
@@ -329,6 +389,7 @@ class MainWindow(QMainWindow):
         previews.setSpacing(10)
         self.original_view = PreviewWidget("Original", "#5bbce4")
         self.enhanced_view = PreviewWidget("Enhanced", "#55e0c4")
+        self.enhanced_view.frame_presented.connect(self._record_display_timestamp)
         previews.addWidget(self.original_view, 1)
         previews.addWidget(self.enhanced_view, 1)
         page.addLayout(previews, 1)
@@ -534,6 +595,8 @@ class MainWindow(QMainWindow):
             return
 
         key, width, height = self._current_size()
+        original_width, original_height = self.original_view.preview_extent()
+        enhanced_width, enhanced_height = self.enhanced_view.preview_extent()
         config = RunConfig(
             root=self.root,
             model_name=model_name,
@@ -543,6 +606,10 @@ class MainWindow(QMainWindow):
             height=height,
             source=self.source,
             source_kind=self.source_kind,
+            # 两个预览区等宽排布，使用较小的可用尺寸可确保同一组原图/增强图
+            # 缩略图都能直接显示；完整增强帧仍在工作线程内写入输出文件。
+            preview_width=max(1, min(original_width, enhanced_width)),
+            preview_height=max(1, min(original_height, enhanced_height)),
             save_output=self.save_checkbox.isChecked(),
             output_dir=(
                 Path(self.output_dir.text()).expanduser()
@@ -552,34 +619,62 @@ class MainWindow(QMainWindow):
         )
         # 新任务允许正常显示帧；同时先清除上一次任务留下的画面。
         self._clear_previews_on_finish = False
+        self._display_timer.stop()
+        self._metrics_timer.stop()
+        self._playback_active = False
+        self._playback_paused = False
+        self._last_display_time = None
+        self._display_intervals.clear()
         self.original_view.clear_frame()
         self.enhanced_view.clear_frame()
+        self.inference_card.clear_value("ms")
+        self.inference_fps_card.clear_value("FPS")
+        self.total_fps_card.clear_value("FPS")
 
         # 每次运行新建线程，结束后由 Qt 安全回收。
         self.worker = InferenceWorker(config, self.registry.get(model_name), self)
         self.worker.frames_ready.connect(self._show_frames)
-        self.worker.metrics_ready.connect(self._show_metrics)
+        self.worker.playback_ready.connect(self._start_playback)
+        self.worker.prebuffer_progress.connect(self._show_prebuffer_progress)
         self.worker.state_changed.connect(self._set_state)
         self.worker.error.connect(self._show_error)
         self.worker.output_saved.connect(self._show_saved)
         self.worker.finished.connect(self._worker_finished)
         self.pause_button.setText("Ⅱ  暂停")
         self._set_controls_running(True)
+        self._set_state("正在初始化…")
         self.worker.start()
+        self._metrics_timer.start()
 
     def toggle_pause(self) -> None:
         if self.worker is None:
             return
         should_pause = "暂停" in self.pause_button.text()
         self.worker.request_pause(should_pause)
+        self._playback_paused = should_pause
+        if should_pause:
+            self._display_timer.stop()
+        elif self._playback_active:
+            # 暂停持续时间不能计入相邻两张显示帧的间隔。
+            self._last_display_time = None
+            self._update_display_interval()
+            self._display_timer.start()
         self.pause_button.setText("▶  继续" if should_pause else "Ⅱ  暂停")
-        self._set_state("已暂停" if should_pause else "运行中")
+        if should_pause:
+            self._set_state("已暂停")
+        elif self._playback_active:
+            self._set_state("播放中")
+        else:
+            self._set_state("正在预缓冲")
 
     def stop_processing(self) -> None:
         if self.worker is not None:
             # 点击“结束”后立即恢复两个预览区的黑色等待界面。工作线程可能
             # 仍有少量 frames_ready 信号排队，因此同时设置标志阻止旧帧回填。
             self._clear_previews_on_finish = True
+            self._playback_active = False
+            self._display_timer.stop()
+            self._metrics_timer.stop()
             self.original_view.clear_frame()
             self.enhanced_view.clear_frame()
             self.worker.request_stop()
@@ -588,16 +683,87 @@ class MainWindow(QMainWindow):
             self._set_state("正在结束…")
 
     def _show_frames(self, original: np.ndarray, enhanced: np.ndarray) -> None:
-        # 用户已经点击“结束”时丢弃队列中的尾帧，防止等待界面再次被覆盖。
+        """显示单张图像结果；视频和摄像头由_display_next_frame处理。"""
         if self._clear_previews_on_finish:
             return
         self.original_view.set_frame(original)
         self.enhanced_view.set_frame(enhanced)
+        # 单张图像可能在第一个200 ms定时器触发前就处理完成，因此在收到
+        # 图像结果时主动读取一次性能快照，避免卡片始终显示“--”。
+        if self.source_kind == "image":
+            self._show_metrics()
 
-    def _show_metrics(self, inference_ms: float, inference_fps: float, total_fps: float) -> None:
-        self.inference_card.set_value(inference_ms, "ms")
-        self.inference_fps_card.set_value(inference_fps, "FPS")
-        self.total_fps_card.set_value(total_fps, "FPS")
+    def _show_prebuffer_progress(self, current: int, target: int) -> None:
+        if not self._playback_active and not self._clear_previews_on_finish:
+            self._set_state(f"正在预缓冲 {current}/{target}")
+
+    def _start_playback(self, source_fps: float) -> None:
+        """缓存就绪后按源FPS或实际处理能力启动平稳播放。"""
+        if self._clear_previews_on_finish or self.worker is None:
+            return
+        self._source_fps = source_fps if source_fps > 0 else 30.0
+        self._playback_active = True
+        self._last_display_time = None
+        self._update_display_interval()
+        if not self._playback_paused:
+            self._display_timer.start()
+        self._set_state("摄像头运行中" if self.source_kind == "camera" else "播放中")
+
+    def _update_display_interval(self) -> None:
+        """推理快时跟随源FPS，推理慢时自动降低到真实生产能力。"""
+        if self.worker is None:
+            return
+        target_fps = self.worker.recommended_display_fps()
+        interval_ms = max(1, round(1000.0 / max(target_fps, 1.0)))
+        if self._display_timer.interval() != interval_ms:
+            self._display_timer.setInterval(interval_ms)
+
+    def _display_next_frame(self) -> None:
+        """Qt主线程按固定节奏消费一组同步缩略图，不允许旧帧事件堆积。"""
+        if (
+            self.worker is None
+            or self._clear_previews_on_finish
+            or self._playback_paused
+        ):
+            return
+        frames = self.worker.take_preview_frame()
+        if frames is None:
+            return
+        original, enhanced = frames
+        self.original_view.set_frame(original)
+        self.enhanced_view.set_frame(enhanced)
+
+    def _record_display_timestamp(self) -> None:
+        now = time.perf_counter()
+        if self._last_display_time is not None:
+            self._display_intervals.append(now - self._last_display_time)
+        self._last_display_time = now
+
+    def _actual_display_fps(self) -> float | None:
+        if not self._display_intervals:
+            return None
+        mean_interval = sum(self._display_intervals) / len(self._display_intervals)
+        return 1.0 / max(mean_interval, 1e-6)
+
+    def _show_metrics(self) -> None:
+        """每200 ms刷新一次稳定指标，显示最近60帧的平均结果。"""
+        if self.worker is None:
+            return
+        inference_ms, inference_fps, _processing_fps, sample_count = (
+            self.worker.metrics_snapshot()
+        )
+        if sample_count > 0 and inference_ms is not None and inference_fps is not None:
+            self.inference_card.set_value(inference_ms, "ms")
+            self.inference_fps_card.set_value(inference_fps, "FPS")
+
+        display_fps = self._actual_display_fps()
+        if display_fps is not None:
+            self.total_fps_card.set_value(display_fps, "FPS")
+
+        # 处理能力或缓冲水位发生变化时平滑调整消费速度；计时器最多每
+        # 200 ms改一次，避免逐帧修改间隔造成新的抖动。
+        if self._playback_active and not self._playback_paused:
+            self._update_display_interval()
 
     def _set_state(self, state: str) -> None:
         self.status_badge.setText(f"●  {state}")
@@ -609,6 +775,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"结果已保存：{path}", 12000)
 
     def _worker_finished(self) -> None:
+        self._display_timer.stop()
+        self._metrics_timer.stop()
+        self._playback_active = False
         self._set_controls_running(False)
         if "正在结束" in self.status_badge.text():
             self._set_state("已结束")
@@ -623,6 +792,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802
         # 先请求线程安全退出；仍在释放大型 engine 时暂缓关闭，防止 QThread 被强制销毁。
         if self.worker is not None and self.worker.isRunning():
+            self._display_timer.stop()
+            self._metrics_timer.stop()
             self.worker.request_stop()
             if not self.worker.wait(8000):
                 self._set_state("正在释放 GPU 资源…")
