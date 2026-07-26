@@ -677,6 +677,13 @@ class MainWindow(QMainWindow):
             self._metrics_timer.stop()
             self.original_view.clear_frame()
             self.enhanced_view.clear_frame()
+            # 红色“结束”表示本次任务已终止，性能读数不应继续保留上一帧的
+            # 结果。同步清空显示时间窗口和三张指标卡，恢复程序初始状态。
+            self._last_display_time = None
+            self._display_intervals.clear()
+            self.inference_card.clear_value("ms")
+            self.inference_fps_card.clear_value("FPS")
+            self.total_fps_card.clear_value("FPS")
             self.worker.request_stop()
             self.pause_button.setEnabled(False)
             self.stop_button.setEnabled(False)
