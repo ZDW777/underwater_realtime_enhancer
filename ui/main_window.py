@@ -246,6 +246,9 @@ class MainWindow(QMainWindow):
         self.worker: InferenceWorker | None = None
         self.source: str | int | None = None
         self.source_kind: str | None = None
+        # 自定义宽高只有在用户点击“确认尺寸”后才生效。输入过程中保持
+        # None，防止每次 QSpinBox 数值变化都解析路径并创建临时目录。
+        self._confirmed_custom_size: tuple[int, int] | None = None
         # 仅当用户主动点击红色“结束”按钮时置为 True，用于忽略工作线程
         # 已经排队但尚未送达主线程的最后几帧，确保预览区保持等待状态。
         self._clear_previews_on_finish = False
@@ -333,6 +336,10 @@ class MainWindow(QMainWindow):
         self.resolution_combo = QComboBox()
         for key, (text, _, _) in RESOLUTIONS.items():
             self.resolution_combo.addItem(text, key)
+        self.confirm_size_button = QPushButton("✓  确认尺寸")
+        self.confirm_size_button.setToolTip(
+            "输入完整的自定义宽高后点击确认，届时才解析权重路径并创建目录。"
+        )
         self.width_spin = QSpinBox()
         self.width_spin.setRange(64, 7680)
         self.width_spin.setValue(1920)
@@ -348,7 +355,9 @@ class MainWindow(QMainWindow):
         inference_grid.addWidget(QLabel("推理模式"), 0, 3)
         inference_grid.addWidget(self.backend_combo, 0, 4)
         inference_grid.addWidget(QLabel("处理分辨率"), 1, 0)
-        inference_grid.addWidget(self.resolution_combo, 1, 1, 1, 2)
+        # “确认尺寸”与上一行“刷新”位于同一列，且只在自定义模式下可用。
+        inference_grid.addWidget(self.resolution_combo, 1, 1)
+        inference_grid.addWidget(self.confirm_size_button, 1, 2)
         inference_grid.addWidget(self.width_spin, 1, 3)
         inference_grid.addWidget(self.height_spin, 1, 4)
         self.weight_hint = QLabel()
@@ -420,11 +429,12 @@ class MainWindow(QMainWindow):
         self.open_file_button.clicked.connect(self._choose_file)
         self.camera_button.clicked.connect(self._choose_camera)
         self.refresh_button.clicked.connect(self.refresh_models)
-        self.resolution_combo.currentIndexChanged.connect(self._update_resolution_controls)
+        self.resolution_combo.currentIndexChanged.connect(self._on_resolution_changed)
+        self.confirm_size_button.clicked.connect(self._confirm_custom_resolution)
         self.model_combo.currentIndexChanged.connect(self._update_summary)
         self.backend_combo.currentIndexChanged.connect(self._update_summary)
-        self.width_spin.valueChanged.connect(self._update_summary)
-        self.height_spin.valueChanged.connect(self._update_summary)
+        self.width_spin.valueChanged.connect(self._on_custom_size_edited)
+        self.height_spin.valueChanged.connect(self._on_custom_size_edited)
         self.save_checkbox.toggled.connect(self.output_dir.setEnabled)
         self.save_checkbox.toggled.connect(self.output_button.setEnabled)
         self.output_button.clicked.connect(self._choose_output_dir)
@@ -510,7 +520,32 @@ class MainWindow(QMainWindow):
         is_custom = self.resolution_combo.currentData() == "other"
         self.width_spin.setEnabled(is_custom)
         self.height_spin.setEnabled(is_custom)
+        self.confirm_size_button.setEnabled(is_custom)
         self._update_summary()
+
+    def _on_resolution_changed(self) -> None:
+        """切换分辨率模式后使旧的自定义尺寸确认失效。"""
+        self._confirmed_custom_size = None
+        self._update_resolution_controls()
+
+    def _on_custom_size_edited(self) -> None:
+        """输入过程只更新提示，不解析权重路径，也不创建分辨率目录。"""
+        if self.resolution_combo.currentData() != "other":
+            return
+        self._confirmed_custom_size = None
+        self._update_summary()
+
+    def _confirm_custom_resolution(self) -> None:
+        """确认完整宽高；路径解析产生的目录创建从此时才允许发生。"""
+        key, width, height = self._current_size()
+        if key != "other":
+            return
+        self._confirmed_custom_size = (width, height)
+        self._update_summary()
+        self.statusBar().showMessage(
+            f"已确认自定义处理分辨率：{width}×{height}",
+            5000,
+        )
 
     def _update_summary(self) -> None:
         """同步刷新底部摘要和当前设置对应的完整权重相对路径。"""
@@ -518,11 +553,22 @@ class MainWindow(QMainWindow):
             return
         model = self.model_combo.currentText() or "--"
         backend_text = self.backend_combo.currentText()
-        _, width, height = self._current_size()
+        key, width, height = self._current_size()
         resolution = f"{width}x{height}"
         self.summary.setText(
             f"模型  {model}    ·    模式  {backend_text}    ·    输出  {width}×{height}"
         )
+
+        # 自定义尺寸尚未确认时在此直接返回。这样输入 1072 的中间值
+        # 1、10、107 都不会进入 WeightResolver.resolve() 创建冗余目录。
+        if (
+            key == "other"
+            and self._confirmed_custom_size != (width, height)
+        ):
+            self.weight_hint.setText(
+                "○ 待确认    输入完整宽高后点击“确认尺寸”"
+            )
+            return
 
         backend_key = self.backend_combo.currentData()
         if model and backend_key:
@@ -566,6 +612,7 @@ class MainWindow(QMainWindow):
             self.refresh_button,
             self.backend_combo,
             self.resolution_combo,
+            self.confirm_size_button,
             self.width_spin,
             self.height_spin,
             self.save_checkbox,
@@ -595,6 +642,16 @@ class MainWindow(QMainWindow):
             return
 
         key, width, height = self._current_size()
+        if (
+            key == "other"
+            and self._confirmed_custom_size != (width, height)
+        ):
+            QMessageBox.warning(
+                self,
+                "自定义尺寸未确认",
+                "请完整输入处理宽度和高度，然后点击“确认尺寸”。",
+            )
+            return
         original_width, original_height = self.original_view.preview_extent()
         enhanced_width, enhanced_height = self.enhanced_view.preview_extent()
         config = RunConfig(
